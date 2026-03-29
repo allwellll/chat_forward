@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 import json
 import os
+import socket
 import time
 import traceback
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from itertools import count
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import requests
 
@@ -15,19 +17,29 @@ PROVIDERS = {
         "name": "codex-for-me",
         "base_url": "https://api-mobile.codex-for.me/v1",
         "wire_api": "responses",
-        "requires_openai_auth": True,
+        "auth_header": "Authorization",
+        "auth_prefix": "Bearer ",
     },
     "right": {
         "name": "right",
         "base_url": "https://right.codes/codex/v1",
         "wire_api": "responses",
-        "requires_openai_auth": True,
+        "auth_header": "Authorization",
+        "auth_prefix": "Bearer ",
     },
     "fox": {
         "name": "fox",
         "base_url": "https://code.newcli.com/codex/v1",
         "wire_api": "responses",
-        "requires_openai_auth": True,
+        "auth_header": "Authorization",
+        "auth_prefix": "Bearer ",
+    },
+    "fox-gemini": {
+        "name": "fox-gemini",
+        "base_url": "https://code.newcli.com/gemini/v1beta",
+        "wire_api": "gemini_generate_content",
+        "auth_header": "x-goog-api-key",
+        "auth_prefix": "",
     },
 }
 
@@ -139,7 +151,7 @@ def normalize_message_content(content: Any) -> str | list[dict[str, Any]]:
     return normalized
 
 
-def chat_request_to_responses_payload(chat_request: dict[str, Any]) -> dict[str, Any]:
+def validate_chat_request(chat_request: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
     if not isinstance(chat_request, dict):
         raise RequestError(400, "Request body must be a JSON object.")
 
@@ -153,6 +165,24 @@ def chat_request_to_responses_payload(chat_request: dict[str, Any]) -> dict[str,
 
     if "n" in chat_request and chat_request["n"] not in (None, 1):
         raise RequestError(400, "This proxy only supports `n = 1`.")
+
+    return model.strip(), messages
+
+
+def normalize_model_name_for_provider(provider: dict[str, Any], model: str) -> str:
+    normalized = model.strip()
+    if provider.get("wire_api") != "gemini_generate_content":
+        return normalized
+
+    # Some OpenAI-compatible clients save Gemini models with provider/path prefixes
+    # like `models/gemini-3-flash` or `google/gemini-3-flash`.
+    while "/" in normalized:
+        normalized = normalized.split("/", 1)[1].strip()
+    return normalized
+
+
+def chat_request_to_responses_payload(chat_request: dict[str, Any]) -> dict[str, Any]:
+    model, messages = validate_chat_request(chat_request)
 
     payload: dict[str, Any] = {
         "model": model,
@@ -168,6 +198,108 @@ def chat_request_to_responses_payload(chat_request: dict[str, Any]) -> dict[str,
             payload[field] = chat_request[field]
 
     return payload
+
+
+def normalize_gemini_message_parts(content: Any) -> list[dict[str, Any]]:
+    if content is None:
+        return [{"text": ""}]
+
+    if isinstance(content, str):
+        return [{"text": content}]
+
+    if not isinstance(content, list):
+        raise RequestError(400, "Message content must be a string or an array.")
+
+    parts: list[dict[str, Any]] = []
+    for part in content:
+        if not isinstance(part, dict):
+            raise RequestError(400, "Each content part must be an object.")
+
+        if part.get("type") != "text":
+            raise RequestError(
+                400,
+                "Gemini upstream currently only supports text content parts through this proxy.",
+            )
+
+        parts.append({"text": part.get("text", "")})
+
+    return parts or [{"text": ""}]
+
+
+def append_gemini_content(contents: list[dict[str, Any]], role: str, parts: list[dict[str, Any]]) -> None:
+    if contents and contents[-1].get("role") == role:
+        contents[-1]["parts"].extend(parts)
+        return
+
+    contents.append({"role": role, "parts": parts})
+
+
+def chat_request_to_gemini_payload(chat_request: dict[str, Any]) -> dict[str, Any]:
+    model, messages = validate_chat_request(chat_request)
+
+    unsupported_fields = [
+        field
+        for field in ("tools", "tool_choice", "parallel_tool_calls", "reasoning", "text", "truncation")
+        if field in chat_request
+    ]
+    if unsupported_fields:
+        raise RequestError(
+            400,
+            f"Gemini upstream does not support these fields through this proxy: {', '.join(unsupported_fields)}.",
+        )
+
+    system_parts: list[dict[str, Any]] = []
+    contents: list[dict[str, Any]] = []
+
+    for message in messages:
+        if not isinstance(message, dict):
+            raise RequestError(400, "Each message must be an object.")
+
+        role = message.get("role")
+        if role not in {"system", "developer", "user", "assistant"}:
+            raise RequestError(400, f"Unsupported message role: {role!r}")
+
+        parts = normalize_gemini_message_parts(message.get("content"))
+        if role in {"system", "developer"}:
+            system_parts.extend(parts)
+            continue
+
+        append_gemini_content(contents, "model" if role == "assistant" else "user", parts)
+
+    if not contents:
+        raise RequestError(400, "Gemini upstream requires at least one non-system chat message.")
+
+    generation_config: dict[str, Any] = {}
+    max_tokens = chat_request.get("max_completion_tokens", chat_request.get("max_tokens"))
+    if max_tokens is not None:
+        generation_config["maxOutputTokens"] = max_tokens
+    if "temperature" in chat_request:
+        generation_config["temperature"] = chat_request["temperature"]
+    if "top_p" in chat_request:
+        generation_config["topP"] = chat_request["top_p"]
+
+    stop = chat_request.get("stop")
+    if isinstance(stop, str):
+        generation_config["stopSequences"] = [stop]
+    elif isinstance(stop, list) and all(isinstance(item, str) for item in stop):
+        generation_config["stopSequences"] = stop
+
+    payload: dict[str, Any] = {"contents": contents}
+    if system_parts:
+        payload["systemInstruction"] = {"parts": system_parts}
+    if generation_config:
+        payload["generationConfig"] = generation_config
+
+    return payload
+
+
+def chat_request_to_upstream_payload(provider: dict[str, Any], chat_request: dict[str, Any]) -> dict[str, Any]:
+    wire_api = provider.get("wire_api")
+    if wire_api == "responses":
+        return chat_request_to_responses_payload(chat_request)
+    if wire_api == "gemini_generate_content":
+        return chat_request_to_gemini_payload(chat_request)
+    raise RequestError(500, f"Unsupported upstream wire_api: {wire_api}", "server_error")
 
 
 def extract_assistant_message(response_payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
@@ -245,6 +377,105 @@ def responses_to_chat_completion(response_payload: dict[str, Any]) -> dict[str, 
             "total_tokens": usage.get("total_tokens", 0),
         },
     }
+
+
+def parse_unix_timestamp(value: Any) -> int:
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str) and value:
+        try:
+            return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+        except ValueError:
+            return int(time.time())
+    return int(time.time())
+
+
+def gemini_finish_reason_to_chat(finish_reason: str | None) -> str:
+    if finish_reason == "MAX_TOKENS":
+        return "length"
+    if finish_reason in {"SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII"}:
+        return "content_filter"
+    return "stop"
+
+
+def gemini_usage_to_chat_usage(usage: dict[str, Any] | None) -> dict[str, int]:
+    usage = usage or {}
+    return {
+        "prompt_tokens": usage.get("promptTokenCount", 0),
+        "completion_tokens": usage.get("candidatesTokenCount", 0),
+        "total_tokens": usage.get("totalTokenCount", 0),
+    }
+
+
+def extract_gemini_text(payload: dict[str, Any]) -> str:
+    text_parts: list[str] = []
+    candidates = payload.get("candidates") or []
+    if not candidates:
+        return ""
+
+    content = (candidates[0].get("content") or {}).get("parts") or []
+    for part in content:
+        if isinstance(part, dict) and isinstance(part.get("text"), str):
+            text_parts.append(part["text"])
+    return "".join(text_parts)
+
+
+def gemini_to_chat_completion(response_payload: dict[str, Any], requested_model: str) -> dict[str, Any]:
+    finish_reason = gemini_finish_reason_to_chat(((response_payload.get("candidates") or [{}])[0]).get("finishReason"))
+    text = extract_gemini_text(response_payload)
+
+    return {
+        "id": response_payload.get("responseId", f"chatcmpl-proxy-{int(time.time())}"),
+        "object": "chat.completion",
+        "created": parse_unix_timestamp(response_payload.get("createTime")),
+        "model": response_payload.get("modelVersion", requested_model),
+        "system_fingerprint": "",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": finish_reason,
+            }
+        ],
+        "usage": gemini_usage_to_chat_usage(response_payload.get("usageMetadata")),
+    }
+
+
+def upstream_error_payload(response: requests.Response | None) -> dict[str, Any]:
+    status = response.status_code if response is not None else 502
+    raw = response.text if response is not None else ""
+    request_id = ""
+    reason = ""
+    if response is not None:
+        request_id = response.headers.get("x-oneapi-request-id", "").strip()
+        reason = (response.reason or "").strip()
+
+    if raw:
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            payload = None
+
+        if isinstance(payload, dict):
+            existing_error = payload.get("error")
+            if isinstance(existing_error, dict) and existing_error.get("message"):
+                return payload
+
+            message = payload.get("message") or payload.get("statusMessage") or payload.get("detail")
+            if message:
+                if request_id:
+                    message = f"{message} (upstream request id: {request_id})"
+                return error_body(message, "upstream_error")
+
+        message = raw.strip()
+        if request_id:
+            message = f"{message} (upstream request id: {request_id})"
+        return error_body(message, "upstream_error")
+
+    message = reason or f"Upstream request failed with status {status}."
+    if request_id:
+        message = f"{message} (upstream request id: {request_id})"
+    return error_body(message, "upstream_error")
 
 
 def error_body(message: str, error_type: str = "invalid_request_error") -> dict[str, Any]:
@@ -352,13 +583,13 @@ def chat_chunk_payload(
     delta: dict[str, Any],
     finish_reason: str | None = None,
     usage: Any = UNSET,
+    include_system_fingerprint: bool = True,
 ) -> dict[str, Any]:
     payload = {
         "id": response_id,
         "object": "chat.completion.chunk",
         "created": created,
         "model": model,
-        "system_fingerprint": "",
         "choices": [
             {
                 "index": 0,
@@ -367,6 +598,8 @@ def chat_chunk_payload(
             }
         ],
     }
+    if include_system_fingerprint:
+        payload["system_fingerprint"] = ""
     if usage is not UNSET:
         payload["usage"] = usage
     return payload
@@ -525,6 +758,70 @@ def responses_stream_events_to_chat_chunks(
         }
 
 
+def gemini_stream_events_to_chat_chunks(
+    events,
+    requested_model: str,
+    include_usage: bool = False,
+):
+    response_id = f"chatcmpl-proxy-{int(time.time())}"
+    created = int(time.time())
+    model = requested_model
+    finish_reason = "stop"
+    usage: dict[str, int] | None = None
+    stream_finished = False
+
+    for _event_name, data in events:
+        if data == "[DONE]":
+            break
+
+        payload = json.loads(data)
+        if payload.get("error"):
+            raise RequestError(502, payload.get("message") or "Upstream stream failed.", "upstream_error")
+
+        response_id = payload.get("responseId", response_id)
+        created = parse_unix_timestamp(payload.get("createTime"))
+        model = payload.get("modelVersion", model)
+        usage = gemini_usage_to_chat_usage(payload.get("usageMetadata"))
+
+        candidates = payload.get("candidates") or []
+        if candidates:
+            finish_reason = gemini_finish_reason_to_chat(candidates[0].get("finishReason"))
+            if candidates[0].get("finishReason"):
+                stream_finished = True
+
+        text = extract_gemini_text(payload)
+        if text:
+            yield chat_chunk_payload(
+                response_id=response_id,
+                created=created,
+                model=model,
+                delta={"content": text},
+                include_system_fingerprint=False,
+            )
+
+        if stream_finished:
+            break
+
+    yield chat_chunk_payload(
+        response_id=response_id,
+        created=created,
+        model=model,
+        delta={},
+        finish_reason=finish_reason,
+        include_system_fingerprint=False,
+    )
+
+    if include_usage:
+        yield {
+            "id": response_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [],
+            "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
+
+
 class ChatForwardHandler(BaseHTTPRequestHandler):
     server_version = "ChatForward/0.1"
     protocol_version = "HTTP/1.1"
@@ -558,25 +855,21 @@ class ChatForwardHandler(BaseHTTPRequestHandler):
             provider = PROVIDERS[server_name]
 
             body = self.read_json_body()
-            upstream_payload = chat_request_to_responses_payload(body)
+            requested_model = normalize_model_name_for_provider(provider, str(body.get("model", "")))
+            upstream_payload = chat_request_to_upstream_payload(provider, body)
             if body.get("stream") is True:
-                self.stream_request(provider, upstream_payload, body.get("stream_options"))
+                self.stream_request(provider, requested_model, upstream_payload, body.get("stream_options"))
                 return
 
-            upstream_response = self.forward_request(provider, upstream_payload)
-            chat_response = responses_to_chat_completion(upstream_response)
+            upstream_response = self.forward_request(provider, requested_model, upstream_payload)
+            chat_response = self.upstream_to_chat_completion(provider, requested_model, upstream_response)
             self.send_json(200, chat_response)
         except RequestError as exc:
             self.send_json(exc.status, error_body(exc.message, exc.error_type))
         except requests.HTTPError as exc:
             response = exc.response
             status = response.status_code if response is not None else 502
-            raw = response.text if response is not None else ""
-            try:
-                payload = json.loads(raw)
-            except json.JSONDecodeError:
-                payload = error_body(raw or "Upstream request failed.", "upstream_error")
-            self.send_json(status, payload)
+            self.send_json(status, upstream_error_payload(response))
         except requests.RequestException as exc:
             self.send_json(502, error_body(f"Upstream connection failed: {exc}", "upstream_error"))
         except Exception:
@@ -613,11 +906,32 @@ class ChatForwardHandler(BaseHTTPRequestHandler):
             raise RequestError(400, "Request body must be a JSON object.")
         return body
 
-    def forward_request(self, provider: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
-        return self.forward_request_via_stream(provider, payload)
+    def forward_request(self, provider: dict[str, Any], requested_model: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if provider.get("wire_api") == "responses":
+            return self.forward_request_via_stream(provider, requested_model, payload)
+        if provider.get("wire_api") == "gemini_generate_content":
+            return self.forward_request_json(provider, requested_model, payload)
+        raise RequestError(500, f"Unsupported upstream wire_api: {provider.get('wire_api')}", "server_error")
 
-    def forward_request_via_stream(self, provider: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
-        url, headers = self.build_upstream_request(provider, extra_headers={"Accept": "text/event-stream"})
+    def forward_request_json(self, provider: dict[str, Any], requested_model: str, payload: dict[str, Any]) -> dict[str, Any]:
+        url, headers = self.build_upstream_request(provider, requested_model, stream=False)
+        timeout = float(os.environ.get("UPSTREAM_TIMEOUT_SECONDS", "120"))
+        response = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        response.raise_for_status()
+        return response.json()
+
+    def forward_request_via_stream(
+        self,
+        provider: dict[str, Any],
+        requested_model: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        url, headers = self.build_upstream_request(
+            provider,
+            requested_model,
+            stream=True,
+            extra_headers={"Accept": "text/event-stream"},
+        )
         stream_payload = dict(payload)
         stream_payload["stream"] = True
         timeout = float(os.environ.get("UPSTREAM_TIMEOUT_SECONDS", "120"))
@@ -628,12 +942,33 @@ class ChatForwardHandler(BaseHTTPRequestHandler):
     def stream_request(
         self,
         provider: dict[str, Any],
+        requested_model: str,
+        payload: dict[str, Any],
+        stream_options: dict[str, Any] | None,
+    ) -> None:
+        if provider.get("wire_api") == "responses":
+            self.stream_request_responses(provider, requested_model, payload, stream_options)
+            return
+        if provider.get("wire_api") == "gemini_generate_content":
+            self.stream_request_gemini(provider, requested_model, payload, stream_options)
+            return
+        raise RequestError(500, f"Unsupported upstream wire_api: {provider.get('wire_api')}", "server_error")
+
+    def stream_request_responses(
+        self,
+        provider: dict[str, Any],
+        requested_model: str,
         payload: dict[str, Any],
         stream_options: dict[str, Any] | None,
     ) -> None:
         stream_payload = dict(payload)
         stream_payload["stream"] = True
-        url, headers = self.build_upstream_request(provider, extra_headers={"Accept": "text/event-stream"})
+        url, headers = self.build_upstream_request(
+            provider,
+            requested_model,
+            stream=True,
+            extra_headers={"Accept": "text/event-stream"},
+        )
 
         include_usage = bool((stream_options or {}).get("include_usage"))
         timeout = float(os.environ.get("UPSTREAM_TIMEOUT_SECONDS", "120"))
@@ -641,8 +976,9 @@ class ChatForwardHandler(BaseHTTPRequestHandler):
             response.raise_for_status()
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Cache-Control", "no-cache, no-transform")
             self.send_header("Connection", "close")
+            self.send_header("X-Accel-Buffering", "no")
             self.send_cors_headers()
             self.end_headers()
             self.close_connection = True
@@ -651,15 +987,86 @@ class ChatForwardHandler(BaseHTTPRequestHandler):
                 self.wfile.write(sse_frame(json.dumps(chunk, ensure_ascii=False)))
                 self.wfile.flush()
 
-        self.wfile.write(sse_frame("[DONE]"))
-        self.wfile.flush()
+        self.finish_sse_response()
+
+    def stream_request_gemini(
+        self,
+        provider: dict[str, Any],
+        requested_model: str,
+        payload: dict[str, Any],
+        stream_options: dict[str, Any] | None,
+    ) -> None:
+        url, headers = self.build_upstream_request(
+            provider,
+            requested_model,
+            stream=True,
+            extra_headers={"Accept": "text/event-stream"},
+        )
+        include_usage = bool((stream_options or {}).get("include_usage"))
+        timeout = float(os.environ.get("UPSTREAM_TIMEOUT_SECONDS", "120"))
+        with requests.post(url, headers=headers, json=payload, timeout=timeout, stream=True) as response:
+            response.raise_for_status()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache, no-transform")
+            self.send_header("Connection", "close")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_cors_headers()
+            self.end_headers()
+            self.close_connection = True
+            events = iter_sse_events(response.raw)
+            for chunk in gemini_stream_events_to_chat_chunks(
+                events,
+                requested_model=requested_model,
+                include_usage=include_usage,
+            ):
+                self.wfile.write(sse_frame(json.dumps(chunk, ensure_ascii=False)))
+                self.wfile.flush()
+
+        self.finish_sse_response()
+
+    def finish_sse_response(self) -> None:
+        try:
+            self.wfile.write(sse_frame("[DONE]"))
+            self.wfile.flush()
+        finally:
+            self.close_connection = True
+            try:
+                self.connection.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+    def upstream_to_chat_completion(
+        self,
+        provider: dict[str, Any],
+        requested_model: str,
+        response_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        if provider.get("wire_api") == "responses":
+            return responses_to_chat_completion(response_payload)
+        if provider.get("wire_api") == "gemini_generate_content":
+            return gemini_to_chat_completion(response_payload, requested_model)
+        raise RequestError(500, f"Unsupported upstream wire_api: {provider.get('wire_api')}", "server_error")
 
     def build_upstream_request(
         self,
         provider: dict[str, Any],
+        requested_model: str,
+        stream: bool,
         extra_headers: dict[str, str] | None = None,
     ) -> tuple[str, dict[str, str]]:
-        upstream_url = provider["base_url"].rstrip("/") + "/responses"
+        wire_api = provider.get("wire_api")
+        if wire_api == "responses":
+            upstream_url = provider["base_url"].rstrip("/") + "/responses"
+        elif wire_api == "gemini_generate_content":
+            action = "streamGenerateContent?alt=sse" if stream else "generateContent"
+            upstream_url = (
+                provider["base_url"].rstrip("/")
+                + f"/models/{quote(str(requested_model), safe='')}:{action}"
+            )
+        else:
+            raise RequestError(500, f"Unsupported upstream wire_api: {wire_api}", "server_error")
+
         headers = {
             "Content-Type": "application/json",
             "User-Agent": "curl/8.5.0",
@@ -668,11 +1075,11 @@ class ChatForwardHandler(BaseHTTPRequestHandler):
             headers.update(extra_headers)
 
         token = extract_bearer_token(dict(self.headers))
-
-        if provider.get("requires_openai_auth"):
+        auth_header = provider.get("auth_header")
+        if auth_header:
             if not token:
                 raise RequestError(401, "Missing upstream API key in Authorization bearer token.")
-            headers["Authorization"] = f"Bearer {token}"
+            headers[auth_header] = f"{provider.get('auth_prefix', '')}{token}"
 
         return upstream_url, headers
 

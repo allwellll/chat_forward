@@ -7,6 +7,7 @@
 - `/codex-for-me/v1/chat/completions`
 - `/right/v1/chat/completions`
 - `/fox/v1/chat/completions`
+- `/fox-gemini/v1/chat/completions`
 
 ## 启动
 
@@ -40,6 +41,14 @@ curl http://127.0.0.1:8080/codex-for-me/v1/chat/completions \
 ```
 
 必须传 `Authorization: Bearer <key>`；服务只转发请求里带来的 key，不做任何回退。
+
+Gemini 路由同样对外暴露成 `chat/completions`，但服务端会自动转成 Gemini 原生接口：
+
+- 上游路径：`/v1beta/models/{model}:generateContent`
+- 流式路径：`/v1beta/models/{model}:streamGenerateContent?alt=sse`
+- 上游鉴权头：`x-goog-api-key`
+
+也就是说，客户端仍然只需要对代理传 `Authorization: Bearer <key>`，不要把 key 写进代码。
 
 流式调用示例：
 
