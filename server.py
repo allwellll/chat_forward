@@ -59,11 +59,18 @@ UNSET = object()
 
 
 class RequestError(Exception):
-    def __init__(self, status: int, message: str, error_type: str = "invalid_request_error"):
+    def __init__(
+        self,
+        status: int,
+        message: str,
+        error_type: str = "invalid_request_error",
+        payload: dict[str, Any] | None = None,
+    ):
         super().__init__(message)
         self.status = status
         self.message = message
         self.error_type = error_type
+        self.payload = payload
 
 
 class ChatForwardHTTPServer(ThreadingHTTPServer):
@@ -186,6 +193,7 @@ def chat_request_to_responses_payload(chat_request: dict[str, Any]) -> dict[str,
 
     payload: dict[str, Any] = {
         "model": model,
+        "instructions": "",
         "input": [normalize_chat_message(message) for message in messages],
     }
 
@@ -480,6 +488,20 @@ def upstream_error_payload(response: requests.Response | None) -> dict[str, Any]
 
 def error_body(message: str, error_type: str = "invalid_request_error") -> dict[str, Any]:
     return {"error": {"message": message, "type": error_type}}
+
+
+def raise_for_upstream_status(response: requests.Response) -> None:
+    if response.ok:
+        return
+
+    payload = upstream_error_payload(response)
+    error = payload.get("error") or {}
+    raise RequestError(
+        response.status_code,
+        str(error.get("message") or f"Upstream request failed with status {response.status_code}."),
+        str(error.get("type") or "upstream_error"),
+        payload=payload,
+    )
 
 
 def sse_frame(data: str) -> bytes:
@@ -865,7 +887,7 @@ class ChatForwardHandler(BaseHTTPRequestHandler):
             chat_response = self.upstream_to_chat_completion(provider, requested_model, upstream_response)
             self.send_json(200, chat_response)
         except RequestError as exc:
-            self.send_json(exc.status, error_body(exc.message, exc.error_type))
+            self.send_json(exc.status, exc.payload or error_body(exc.message, exc.error_type))
         except requests.HTTPError as exc:
             response = exc.response
             status = response.status_code if response is not None else 502
@@ -917,7 +939,7 @@ class ChatForwardHandler(BaseHTTPRequestHandler):
         url, headers = self.build_upstream_request(provider, requested_model, stream=False)
         timeout = float(os.environ.get("UPSTREAM_TIMEOUT_SECONDS", "120"))
         response = requests.post(url, headers=headers, json=payload, timeout=timeout)
-        response.raise_for_status()
+        raise_for_upstream_status(response)
         return response.json()
 
     def forward_request_via_stream(
@@ -936,7 +958,7 @@ class ChatForwardHandler(BaseHTTPRequestHandler):
         stream_payload["stream"] = True
         timeout = float(os.environ.get("UPSTREAM_TIMEOUT_SECONDS", "120"))
         with requests.post(url, headers=headers, json=stream_payload, timeout=timeout, stream=True) as response:
-            response.raise_for_status()
+            raise_for_upstream_status(response)
             return collect_completed_response(iter_sse_events_from_lines(response.iter_lines(decode_unicode=False)))
 
     def stream_request(
@@ -973,7 +995,7 @@ class ChatForwardHandler(BaseHTTPRequestHandler):
         include_usage = bool((stream_options or {}).get("include_usage"))
         timeout = float(os.environ.get("UPSTREAM_TIMEOUT_SECONDS", "120"))
         with requests.post(url, headers=headers, json=stream_payload, timeout=timeout, stream=True) as response:
-            response.raise_for_status()
+            raise_for_upstream_status(response)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-cache, no-transform")
@@ -1005,7 +1027,7 @@ class ChatForwardHandler(BaseHTTPRequestHandler):
         include_usage = bool((stream_options or {}).get("include_usage"))
         timeout = float(os.environ.get("UPSTREAM_TIMEOUT_SECONDS", "120"))
         with requests.post(url, headers=headers, json=payload, timeout=timeout, stream=True) as response:
-            response.raise_for_status()
+            raise_for_upstream_status(response)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-cache, no-transform")

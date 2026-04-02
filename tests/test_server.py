@@ -156,6 +156,68 @@ class StubGeminiHandler(BaseHTTPRequestHandler):
         return
 
 
+class InstructionsRequiredUpstreamHandler(BaseHTTPRequestHandler):
+    last_request = None
+
+    def do_POST(self):
+        content_length = int(self.headers["Content-Length"])
+        body = self.rfile.read(content_length).decode("utf-8")
+        InstructionsRequiredUpstreamHandler.last_request = {
+            "path": self.path,
+            "headers": dict(self.headers),
+            "body": json.loads(body),
+        }
+
+        if "instructions" not in InstructionsRequiredUpstreamHandler.last_request["body"]:
+            encoded = json.dumps({"detail": "Instructions are required"}).encode("utf-8")
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+            return
+
+        response = {
+            "id": "resp_test",
+            "object": "response",
+            "created_at": 1710000000,
+            "model": "gpt-test",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "proxy works"}],
+                }
+            ],
+            "usage": {"input_tokens": 12, "output_tokens": 5, "total_tokens": 17},
+        }
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        self.wfile.write(
+            f"data: {json.dumps({'type': 'response.completed', 'response': response})}\n\n".encode("utf-8")
+        )
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+
+    def log_message(self, format, *args):
+        return
+
+
+class ErroringUpstreamHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        encoded = json.dumps({"detail": "Instructions are required"}).encode("utf-8")
+        self.send_response(400)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def log_message(self, format, *args):
+        return
+
+
 def serve_in_thread(handler_cls):
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
@@ -222,6 +284,7 @@ class ProxyTests(unittest.TestCase):
             }
         )
         self.assertEqual(payload["model"], "gpt-4.1")
+        self.assertEqual(payload["instructions"], "")
         self.assertEqual(payload["max_output_tokens"], 123)
         self.assertEqual(payload["temperature"], 0.2)
         self.assertEqual(payload["input"][0]["content"], "You are helpful.")
@@ -476,6 +539,36 @@ class ProxyTests(unittest.TestCase):
             proxy_server.server_close()
             upstream_server.server_close()
 
+    def test_end_to_end_proxy_route_includes_blank_instructions(self):
+        upstream_server, _ = serve_in_thread(InstructionsRequiredUpstreamHandler)
+        proxy_server, _ = serve_in_thread(server.ChatForwardHandler)
+        original_provider = server.PROVIDERS["codex-for-me"].copy()
+        server.PROVIDERS["codex-for-me"]["base_url"] = f"http://127.0.0.1:{upstream_server.server_address[1]}"
+
+        try:
+            request_body = {
+                "model": "gpt-5.2",
+                "messages": [{"role": "user", "content": "Say hi"}],
+            }
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{proxy_server.server_address[1]}/codex-for-me/v1/chat/completions",
+                data=json.dumps(request_body).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Authorization": "Bearer sk-test"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=5) as response:
+                body = json.loads(response.read().decode("utf-8"))
+
+            self.assertEqual(body["choices"][0]["message"]["content"], "proxy works")
+            self.assertIn("instructions", InstructionsRequiredUpstreamHandler.last_request["body"])
+            self.assertEqual(InstructionsRequiredUpstreamHandler.last_request["body"]["instructions"], "")
+        finally:
+            server.PROVIDERS["codex-for-me"] = original_provider
+            proxy_server.shutdown()
+            upstream_server.shutdown()
+            proxy_server.server_close()
+            upstream_server.server_close()
+
     def test_missing_authorization_returns_401(self):
         proxy_server, _ = serve_in_thread(server.ChatForwardHandler)
 
@@ -499,6 +592,36 @@ class ProxyTests(unittest.TestCase):
         finally:
             proxy_server.shutdown()
             proxy_server.server_close()
+
+    def test_proxy_returns_specific_upstream_error_message_for_stream_backed_route(self):
+        upstream_server, _ = serve_in_thread(ErroringUpstreamHandler)
+        proxy_server, _ = serve_in_thread(server.ChatForwardHandler)
+        original_provider = server.PROVIDERS["codex-for-me"].copy()
+        server.PROVIDERS["codex-for-me"]["base_url"] = f"http://127.0.0.1:{upstream_server.server_address[1]}"
+
+        try:
+            request_body = {
+                "model": "gpt-5.2",
+                "messages": [{"role": "user", "content": "Say hi"}],
+            }
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{proxy_server.server_address[1]}/codex-for-me/v1/chat/completions",
+                data=json.dumps(request_body).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Authorization": "Bearer sk-test"},
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(request, timeout=5)
+
+            body = json.loads(ctx.exception.read().decode("utf-8"))
+            self.assertEqual(ctx.exception.code, 400)
+            self.assertEqual(body["error"]["message"], "Instructions are required")
+        finally:
+            server.PROVIDERS["codex-for-me"] = original_provider
+            proxy_server.shutdown()
+            upstream_server.shutdown()
+            proxy_server.server_close()
+            upstream_server.server_close()
 
     def test_end_to_end_stream_proxy_route(self):
         upstream_server, _ = serve_in_thread(StubUpstreamHandler)
