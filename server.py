@@ -41,6 +41,13 @@ PROVIDERS = {
         "auth_header": "x-goog-api-key",
         "auth_prefix": "",
     },
+    "siliconflow": {
+        "name": "siliconflow",
+        "base_url": "https://api.siliconflow.cn/v1",
+        "wire_api": "openai_chat_completions",
+        "auth_header": "Authorization",
+        "auth_prefix": "Bearer ",
+    },
 }
 
 FORWARDED_FIELDS = (
@@ -301,12 +308,24 @@ def chat_request_to_gemini_payload(chat_request: dict[str, Any]) -> dict[str, An
     return payload
 
 
+def chat_request_to_openai_chat_payload(chat_request: dict[str, Any]) -> dict[str, Any]:
+    model, messages = validate_chat_request(chat_request)
+
+    payload = dict(chat_request)
+    payload["model"] = model
+    payload["messages"] = messages
+    payload["enable_thinking"] = False
+    return payload
+
+
 def chat_request_to_upstream_payload(provider: dict[str, Any], chat_request: dict[str, Any]) -> dict[str, Any]:
     wire_api = provider.get("wire_api")
     if wire_api == "responses":
         return chat_request_to_responses_payload(chat_request)
     if wire_api == "gemini_generate_content":
         return chat_request_to_gemini_payload(chat_request)
+    if wire_api == "openai_chat_completions":
+        return chat_request_to_openai_chat_payload(chat_request)
     raise RequestError(500, f"Unsupported upstream wire_api: {wire_api}", "server_error")
 
 
@@ -931,7 +950,7 @@ class ChatForwardHandler(BaseHTTPRequestHandler):
     def forward_request(self, provider: dict[str, Any], requested_model: str, payload: dict[str, Any]) -> dict[str, Any]:
         if provider.get("wire_api") == "responses":
             return self.forward_request_via_stream(provider, requested_model, payload)
-        if provider.get("wire_api") == "gemini_generate_content":
+        if provider.get("wire_api") in {"gemini_generate_content", "openai_chat_completions"}:
             return self.forward_request_json(provider, requested_model, payload)
         raise RequestError(500, f"Unsupported upstream wire_api: {provider.get('wire_api')}", "server_error")
 
@@ -973,6 +992,9 @@ class ChatForwardHandler(BaseHTTPRequestHandler):
             return
         if provider.get("wire_api") == "gemini_generate_content":
             self.stream_request_gemini(provider, requested_model, payload, stream_options)
+            return
+        if provider.get("wire_api") == "openai_chat_completions":
+            self.stream_request_openai_chat(provider, requested_model, payload)
             return
         raise RequestError(500, f"Unsupported upstream wire_api: {provider.get('wire_api')}", "server_error")
 
@@ -1047,16 +1069,53 @@ class ChatForwardHandler(BaseHTTPRequestHandler):
 
         self.finish_sse_response()
 
+    def stream_request_openai_chat(
+        self,
+        provider: dict[str, Any],
+        requested_model: str,
+        payload: dict[str, Any],
+    ) -> None:
+        url, headers = self.build_upstream_request(
+            provider,
+            requested_model,
+            stream=True,
+            extra_headers={"Accept": "text/event-stream"},
+        )
+        timeout = float(os.environ.get("UPSTREAM_TIMEOUT_SECONDS", "120"))
+        with requests.post(url, headers=headers, json=payload, timeout=timeout, stream=True) as response:
+            raise_for_upstream_status(response)
+            self.send_response(200)
+            self.send_header(
+                "Content-Type",
+                response.headers.get("Content-Type", "text/event-stream; charset=utf-8"),
+            )
+            self.send_header("Cache-Control", "no-cache, no-transform")
+            self.send_header("Connection", "close")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_cors_headers()
+            self.end_headers()
+            self.close_connection = True
+            for chunk in response.iter_content(chunk_size=8192):
+                if not chunk:
+                    continue
+                self.wfile.write(chunk)
+                self.wfile.flush()
+
+        self.close_streaming_response()
+
     def finish_sse_response(self) -> None:
         try:
             self.wfile.write(sse_frame("[DONE]"))
             self.wfile.flush()
         finally:
-            self.close_connection = True
-            try:
-                self.connection.shutdown(socket.SHUT_WR)
-            except OSError:
-                pass
+            self.close_streaming_response()
+
+    def close_streaming_response(self) -> None:
+        self.close_connection = True
+        try:
+            self.connection.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
 
     def upstream_to_chat_completion(
         self,
@@ -1068,6 +1127,8 @@ class ChatForwardHandler(BaseHTTPRequestHandler):
             return responses_to_chat_completion(response_payload)
         if provider.get("wire_api") == "gemini_generate_content":
             return gemini_to_chat_completion(response_payload, requested_model)
+        if provider.get("wire_api") == "openai_chat_completions":
+            return response_payload
         raise RequestError(500, f"Unsupported upstream wire_api: {provider.get('wire_api')}", "server_error")
 
     def build_upstream_request(
@@ -1086,6 +1147,8 @@ class ChatForwardHandler(BaseHTTPRequestHandler):
                 provider["base_url"].rstrip("/")
                 + f"/models/{quote(str(requested_model), safe='')}:{action}"
             )
+        elif wire_api == "openai_chat_completions":
+            upstream_url = provider["base_url"].rstrip("/") + "/chat/completions"
         else:
             raise RequestError(500, f"Unsupported upstream wire_api: {wire_api}", "server_error")
 

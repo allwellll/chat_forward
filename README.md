@@ -8,6 +8,7 @@
 - `/right/v1/chat/completions`
 - `/fox/v1/chat/completions`
 - `/fox-gemini/v1/chat/completions`
+- `/siliconflow/v1/chat/completions`
 
 ## 启动
 
@@ -49,6 +50,12 @@ Gemini 路由同样对外暴露成 `chat/completions`，但服务端会自动转
 - 上游鉴权头：`x-goog-api-key`
 
 也就是说，客户端仍然只需要对代理传 `Authorization: Bearer <key>`，不要把 key 写进代码。
+
+SiliconFlow 路由本身就是 OpenAI `chat/completions` 协议，代理会直接透传请求和响应，但会强制设置：
+
+- `enable_thinking: false`
+
+也就是说，客户端仍然只需要传模型名和 key，例如 `Qwen/Qwen3.5-35B-A3B`，不需要自己处理关闭思考模式。
 
 流式调用示例：
 

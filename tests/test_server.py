@@ -218,6 +218,76 @@ class ErroringUpstreamHandler(BaseHTTPRequestHandler):
         return
 
 
+class StubOpenAIChatHandler(BaseHTTPRequestHandler):
+    last_request = None
+
+    def do_POST(self):
+        content_length = int(self.headers["Content-Length"])
+        body = self.rfile.read(content_length).decode("utf-8")
+        StubOpenAIChatHandler.last_request = {
+            "path": self.path,
+            "headers": dict(self.headers),
+            "body": json.loads(body),
+        }
+
+        if StubOpenAIChatHandler.last_request["body"].get("stream") is True:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            chunks = [
+                {
+                    "id": "chatcmpl-sf-stream",
+                    "object": "chat.completion.chunk",
+                    "created": 1710000003,
+                    "model": "Qwen/Qwen3.5-35B-A3B",
+                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                },
+                {
+                    "id": "chatcmpl-sf-stream",
+                    "object": "chat.completion.chunk",
+                    "created": 1710000003,
+                    "model": "Qwen/Qwen3.5-35B-A3B",
+                    "choices": [{"index": 0, "delta": {"content": "siliconflow stream"}, "finish_reason": None}],
+                },
+                {
+                    "id": "chatcmpl-sf-stream",
+                    "object": "chat.completion.chunk",
+                    "created": 1710000003,
+                    "model": "Qwen/Qwen3.5-35B-A3B",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                },
+            ]
+            for chunk in chunks:
+                self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode("utf-8"))
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+            return
+
+        response = {
+            "id": "chatcmpl-sf-test",
+            "object": "chat.completion",
+            "created": 1710000002,
+            "model": "Qwen/Qwen3.5-35B-A3B",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "siliconflow works"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13},
+        }
+        encoded = json.dumps(response).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def log_message(self, format, *args):
+        return
+
+
 def serve_in_thread(handler_cls):
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
@@ -315,6 +385,20 @@ class ProxyTests(unittest.TestCase):
         self.assertEqual(payload["generationConfig"]["temperature"], 0.2)
         self.assertEqual(payload["generationConfig"]["topP"], 0.8)
         self.assertEqual(payload["generationConfig"]["stopSequences"], ["END"])
+
+    def test_chat_request_to_openai_chat_payload(self):
+        payload = server.chat_request_to_openai_chat_payload(
+            {
+                "model": "Qwen/Qwen3.5-35B-A3B",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+                "enable_thinking": True,
+            }
+        )
+        self.assertEqual(payload["model"], "Qwen/Qwen3.5-35B-A3B")
+        self.assertEqual(payload["messages"][0]["content"], "hello")
+        self.assertTrue(payload["stream"])
+        self.assertFalse(payload["enable_thinking"])
 
     def test_normalize_model_name_for_gemini_provider(self):
         provider = server.PROVIDERS["fox-gemini"]
@@ -754,6 +838,84 @@ class ProxyTests(unittest.TestCase):
             )
         finally:
             server.PROVIDERS["fox-gemini"] = original_provider
+            proxy_server.shutdown()
+            upstream_server.shutdown()
+            proxy_server.server_close()
+            upstream_server.server_close()
+
+    def test_end_to_end_siliconflow_proxy_route(self):
+        upstream_server, _ = serve_in_thread(StubOpenAIChatHandler)
+        proxy_server, _ = serve_in_thread(server.ChatForwardHandler)
+        original_provider = server.PROVIDERS["siliconflow"].copy()
+        server.PROVIDERS["siliconflow"]["base_url"] = f"http://127.0.0.1:{upstream_server.server_address[1]}/v1"
+
+        try:
+            request_body = {
+                "model": "Qwen/Qwen3.5-35B-A3B",
+                "messages": [{"role": "user", "content": "Say hi"}],
+                "enable_thinking": True,
+            }
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{proxy_server.server_address[1]}/siliconflow/v1/chat/completions",
+                data=json.dumps(request_body).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Authorization": "Bearer sk-test"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=5) as response:
+                body = json.loads(response.read().decode("utf-8"))
+
+            self.assertEqual(body["choices"][0]["message"]["content"], "siliconflow works")
+            self.assertEqual(StubOpenAIChatHandler.last_request["path"], "/v1/chat/completions")
+            self.assertEqual(StubOpenAIChatHandler.last_request["headers"]["Authorization"], "Bearer sk-test")
+            self.assertFalse(StubOpenAIChatHandler.last_request["body"]["enable_thinking"])
+            self.assertEqual(
+                StubOpenAIChatHandler.last_request["body"]["model"],
+                "Qwen/Qwen3.5-35B-A3B",
+            )
+        finally:
+            server.PROVIDERS["siliconflow"] = original_provider
+            proxy_server.shutdown()
+            upstream_server.shutdown()
+            proxy_server.server_close()
+            upstream_server.server_close()
+
+    def test_end_to_end_siliconflow_stream_proxy_route(self):
+        upstream_server, _ = serve_in_thread(StubOpenAIChatHandler)
+        proxy_server, _ = serve_in_thread(server.ChatForwardHandler)
+        original_provider = server.PROVIDERS["siliconflow"].copy()
+        server.PROVIDERS["siliconflow"]["base_url"] = f"http://127.0.0.1:{upstream_server.server_address[1]}/v1"
+
+        try:
+            request_body = {
+                "model": "Qwen/Qwen3.5-35B-A3B",
+                "messages": [{"role": "user", "content": "Say hi"}],
+                "stream": True,
+                "enable_thinking": True,
+            }
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{proxy_server.server_address[1]}/siliconflow/v1/chat/completions",
+                data=json.dumps(request_body).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Authorization": "Bearer sk-test"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=5) as response:
+                body = response.read().decode("utf-8")
+
+            frames = [
+                line[len("data: ") :]
+                for line in body.splitlines()
+                if line.startswith("data: ")
+            ]
+            chunks = [json.loads(frame) for frame in frames[:-1]]
+
+            self.assertEqual(frames[-1], "[DONE]")
+            self.assertEqual(chunks[0]["choices"][0]["delta"]["role"], "assistant")
+            self.assertEqual(chunks[1]["choices"][0]["delta"]["content"], "siliconflow stream")
+            self.assertEqual(chunks[2]["choices"][0]["finish_reason"], "stop")
+            self.assertTrue(StubOpenAIChatHandler.last_request["body"]["stream"])
+            self.assertFalse(StubOpenAIChatHandler.last_request["body"]["enable_thinking"])
+        finally:
+            server.PROVIDERS["siliconflow"] = original_provider
             proxy_server.shutdown()
             upstream_server.shutdown()
             proxy_server.server_close()
