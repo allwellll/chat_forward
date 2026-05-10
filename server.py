@@ -2,8 +2,10 @@
 import json
 import os
 import socket
+import threading
 import time
 import traceback
+import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from itertools import count
@@ -48,6 +50,13 @@ PROVIDERS = {
         "auth_header": "Authorization",
         "auth_prefix": "Bearer ",
     },
+    "input": {
+        "name": "input",
+        "base_url": "https://ai.input.im/v1",
+        "wire_api": "openai_chat_completions",
+        "auth_header": "Authorization",
+        "auth_prefix": "Bearer ",
+    },
 }
 
 FORWARDED_FIELDS = (
@@ -63,6 +72,10 @@ FORWARDED_FIELDS = (
     "truncation",
 )
 UNSET = object()
+POLL_STREAM_DONE_MARKER = "[DONE]"
+POLL_STREAM_TASK_TTL_SECONDS = 600
+POLL_STREAM_TASKS: dict[str, "PollingStreamTask"] = {}
+POLL_STREAM_TASKS_LOCK = threading.Lock()
 
 
 class RequestError(Exception):
@@ -82,6 +95,240 @@ class RequestError(Exception):
 
 class ChatForwardHTTPServer(ThreadingHTTPServer):
     request_queue_size = 20
+
+
+class PollingStreamTask:
+    def __init__(self, provider_name: str, requested_model: str):
+        self.request_id = f"poll_{uuid.uuid4().hex}"
+        self.provider_name = provider_name
+        self.requested_model = requested_model
+        self.upstream_response_id = ""
+        self.created = int(time.time())
+        self.status = "queued"
+        self.pending_text = ""
+        self.accumulated_text = ""
+        self.finish_reason: str | None = None
+        self.usage: dict[str, int] | None = None
+        self.error: dict[str, Any] | None = None
+        self.updated_at = time.time()
+        self._lock = threading.Lock()
+
+    def touch(self) -> None:
+        self.updated_at = time.time()
+
+    def mark_running(self) -> None:
+        with self._lock:
+            self.status = "running"
+            self.touch()
+
+    def set_response_info(self, response_id: str | None = None, model: str | None = None) -> None:
+        with self._lock:
+            if response_id:
+                self.upstream_response_id = response_id
+            if model:
+                self.requested_model = model
+            self.touch()
+
+    def append_text(self, delta: str) -> None:
+        if not delta:
+            return
+        with self._lock:
+            self.pending_text += delta
+            self.accumulated_text += delta
+            self.touch()
+
+    def append_missing_suffix(self, full_text: str) -> None:
+        if not full_text:
+            return
+        with self._lock:
+            if full_text.startswith(self.accumulated_text):
+                suffix = full_text[len(self.accumulated_text) :]
+            else:
+                suffix = ""
+            if suffix:
+                self.pending_text += suffix
+                self.accumulated_text += suffix
+            self.touch()
+
+    def mark_completed(self, finish_reason: str | None, usage: dict[str, int] | None) -> None:
+        with self._lock:
+            self.status = "completed"
+            self.finish_reason = finish_reason or "stop"
+            self.usage = usage
+            self.touch()
+
+    def mark_error(self, message: str, error_type: str = "upstream_error") -> None:
+        with self._lock:
+            self.status = "error"
+            self.error = error_body(message, error_type)["error"]
+            self.touch()
+
+    def poll(self) -> dict[str, Any]:
+        with self._lock:
+            delta = self.pending_text
+            self.pending_text = ""
+            self.touch()
+            payload: dict[str, Any] = {
+                "id": self.request_id,
+                "object": "chat.completion.poll",
+                "status": self.status,
+                "response_id": self.upstream_response_id or self.request_id,
+                "created": self.created,
+                "model": self.requested_model,
+                "delta": delta,
+                "accumulated_text": self.accumulated_text,
+                "done": self.status in {"completed", "error"},
+                "done_marker": POLL_STREAM_DONE_MARKER if self.status in {"completed", "error"} else None,
+            }
+            if self.finish_reason is not None:
+                payload["finish_reason"] = self.finish_reason
+            if self.usage is not None:
+                payload["usage"] = self.usage
+            if self.error is not None:
+                payload["error"] = self.error
+            return payload
+
+
+def prune_polling_stream_tasks() -> None:
+    now = time.time()
+    expired_ids: list[str] = []
+    with POLL_STREAM_TASKS_LOCK:
+        for request_id, task in POLL_STREAM_TASKS.items():
+            if now - task.updated_at > POLL_STREAM_TASK_TTL_SECONDS:
+                expired_ids.append(request_id)
+        for request_id in expired_ids:
+            POLL_STREAM_TASKS.pop(request_id, None)
+
+
+def register_polling_stream_task(task: PollingStreamTask) -> None:
+    prune_polling_stream_tasks()
+    with POLL_STREAM_TASKS_LOCK:
+        POLL_STREAM_TASKS[task.request_id] = task
+
+
+def get_polling_stream_task(request_id: str) -> PollingStreamTask | None:
+    prune_polling_stream_tasks()
+    with POLL_STREAM_TASKS_LOCK:
+        return POLL_STREAM_TASKS.get(request_id)
+
+
+def build_upstream_request_from_headers(
+    provider: dict[str, Any],
+    requested_model: str,
+    request_headers: dict[str, str],
+    stream: bool,
+    extra_headers: dict[str, str] | None = None,
+) -> tuple[str, dict[str, str]]:
+    wire_api = provider.get("wire_api")
+    if wire_api == "responses":
+        upstream_url = provider["base_url"].rstrip("/") + "/responses"
+    elif wire_api == "gemini_generate_content":
+        action = "streamGenerateContent?alt=sse" if stream else "generateContent"
+        upstream_url = (
+            provider["base_url"].rstrip("/")
+            + f"/models/{quote(str(requested_model), safe='')}:{action}"
+        )
+    elif wire_api == "openai_chat_completions":
+        upstream_url = provider["base_url"].rstrip("/") + "/chat/completions"
+    else:
+        raise RequestError(500, f"Unsupported upstream wire_api: {wire_api}", "server_error")
+
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "curl/8.5.0",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+
+    token = extract_bearer_token(request_headers)
+    auth_header = provider.get("auth_header")
+    if auth_header:
+        if not token:
+            raise RequestError(401, "Missing upstream API key in Authorization bearer token.")
+        headers[auth_header] = f"{provider.get('auth_prefix', '')}{token}"
+
+    return upstream_url, headers
+
+
+def run_polling_stream_task(
+    task: PollingStreamTask,
+    provider: dict[str, Any],
+    request_headers: dict[str, str],
+    requested_model: str,
+    payload: dict[str, Any],
+) -> None:
+    task.mark_running()
+
+    try:
+        url, headers = build_upstream_request_from_headers(
+            provider,
+            requested_model,
+            request_headers,
+            stream=True,
+            extra_headers={"Accept": "text/event-stream"},
+        )
+        stream_payload = dict(payload)
+        stream_payload["stream"] = True
+        timeout = float(os.environ.get("UPSTREAM_TIMEOUT_SECONDS", "120"))
+
+        with requests.post(url, headers=headers, json=stream_payload, timeout=timeout, stream=True) as response:
+            raise_for_upstream_status(response)
+            final_response: dict[str, Any] | None = None
+            events = iter_sse_events(response.raw)
+            for _event_name, data in events:
+                if data == "[DONE]":
+                    break
+
+                event = json.loads(data)
+                event_type = event.get("type")
+
+                if event_type == "response.created":
+                    upstream_response = event.get("response") or {}
+                    task.set_response_info(
+                        response_id=upstream_response.get("id"),
+                        model=upstream_response.get("model"),
+                    )
+                    continue
+
+                if event_type == "response.output_text.delta":
+                    task.append_text(str(event.get("delta", "")))
+                    continue
+
+                if event_type == "response.refusal.delta":
+                    task.append_text(str(event.get("delta", "")))
+                    continue
+
+                if event_type == "response.completed":
+                    final_response = event.get("response") or {}
+                    task.set_response_info(
+                        response_id=final_response.get("id"),
+                        model=final_response.get("model"),
+                    )
+                    continue
+
+                if event_type == "response.failed" or event_type == "error":
+                    message = event.get("message")
+                    if not message:
+                        message = ((event.get("error") or {}).get("message")) or "Upstream stream failed."
+                    raise RequestError(502, message, "upstream_error")
+
+            if final_response is None:
+                raise RequestError(502, "Upstream stream did not produce a completed response.", "upstream_error")
+
+            message, finish_reason = extract_assistant_message(final_response)
+            if isinstance(message.get("content"), str):
+                task.append_missing_suffix(message["content"])
+            task.mark_completed(
+                finish_reason=finish_reason,
+                usage=usage_to_chat_usage(final_response.get("usage")),
+            )
+    except RequestError as exc:
+        task.mark_error(exc.message, exc.error_type)
+    except requests.RequestException as exc:
+        task.mark_error(f"Upstream connection failed: {exc}")
+    except Exception:
+        traceback.print_exc()
+        task.mark_error("Internal server error.", "server_error")
 
 
 def extract_bearer_token(headers: dict[str, str]) -> str | None:
@@ -886,12 +1133,31 @@ class ChatForwardHandler(BaseHTTPRequestHandler):
             self.send_json(200, {"status": "ok", "providers": sorted(PROVIDERS)})
             return
 
+        try:
+            server_name, request_id = self.extract_poll_stream_route(parsed.path)
+            if request_id is None:
+                raise RequestError(404, "Route not found.", "not_found_error")
+            self.handle_poll_stream_get(server_name, request_id)
+            return
+        except RequestError as exc:
+            if exc.status != 404:
+                self.send_json(exc.status, exc.payload or error_body(exc.message, exc.error_type))
+                return
+
         self.send_json(404, error_body("Not found.", "not_found_error"))
 
     def do_POST(self) -> None:
         self.log_request_arrival()
         try:
             parsed = urlparse(self.path)
+            poll_route = self.try_extract_poll_stream_route(parsed.path)
+            if poll_route is not None:
+                server_name, request_id = poll_route
+                if request_id is not None:
+                    raise RequestError(404, "Route not found.", "not_found_error")
+                self.handle_poll_stream_create(server_name)
+                return
+
             server_name = self.extract_server_name(parsed.path)
             provider = PROVIDERS[server_name]
 
@@ -927,6 +1193,28 @@ class ChatForwardHandler(BaseHTTPRequestHandler):
             raise RequestError(404, f"Unknown server_name: {server_name}", "not_found_error")
         return server_name
 
+    def try_extract_poll_stream_route(self, path: str) -> tuple[str, str | None] | None:
+        parts = [part for part in path.split("/") if part]
+        if len(parts) == 4 and parts[1:] == ["v1", "chat", "poll-completions"]:
+            server_name = parts[0]
+            if server_name not in PROVIDERS:
+                raise RequestError(404, f"Unknown server_name: {server_name}", "not_found_error")
+            return server_name, None
+
+        if len(parts) == 5 and parts[1:4] == ["v1", "chat", "poll-completions"]:
+            server_name = parts[0]
+            if server_name not in PROVIDERS:
+                raise RequestError(404, f"Unknown server_name: {server_name}", "not_found_error")
+            return server_name, parts[4]
+
+        return None
+
+    def extract_poll_stream_route(self, path: str) -> tuple[str, str | None]:
+        route = self.try_extract_poll_stream_route(path)
+        if route is None:
+            raise RequestError(404, "Route not found.", "not_found_error")
+        return route
+
     def read_json_body(self) -> dict[str, Any]:
         content_length = self.headers.get("Content-Length")
         if not content_length:
@@ -946,6 +1234,55 @@ class ChatForwardHandler(BaseHTTPRequestHandler):
         if not isinstance(body, dict):
             raise RequestError(400, "Request body must be a JSON object.")
         return body
+
+    def handle_poll_stream_create(self, server_name: str) -> None:
+        if server_name != "fox":
+            raise RequestError(404, "Route not found.", "not_found_error")
+
+        provider = PROVIDERS[server_name]
+        if provider.get("wire_api") != "responses":
+            raise RequestError(400, "Polling stream mode currently only supports Responses-backed routes.")
+
+        body = self.read_json_body()
+        requested_model = normalize_model_name_for_provider(provider, str(body.get("model", "")))
+        upstream_payload = chat_request_to_upstream_payload(provider, body)
+        build_upstream_request_from_headers(
+            provider,
+            requested_model,
+            dict(self.headers),
+            stream=True,
+            extra_headers={"Accept": "text/event-stream"},
+        )
+
+        task = PollingStreamTask(provider_name=server_name, requested_model=requested_model)
+        register_polling_stream_task(task)
+        worker = threading.Thread(
+            target=run_polling_stream_task,
+            args=(task, provider.copy(), dict(self.headers), requested_model, upstream_payload),
+            daemon=True,
+        )
+        worker.start()
+
+        self.send_json(
+            202,
+            {
+                "id": task.request_id,
+                "object": "chat.completion.poll",
+                "status": "queued",
+                "done": False,
+                "done_marker": POLL_STREAM_DONE_MARKER,
+                "poll_url": f"/{server_name}/v1/chat/poll-completions/{task.request_id}",
+            },
+        )
+
+    def handle_poll_stream_get(self, server_name: str, request_id: str) -> None:
+        if server_name != "fox":
+            raise RequestError(404, "Route not found.", "not_found_error")
+
+        task = get_polling_stream_task(request_id)
+        if task is None or task.provider_name != server_name:
+            raise RequestError(404, f"Unknown request_id: {request_id}", "not_found_error")
+        self.send_json(200, task.poll())
 
     def forward_request(self, provider: dict[str, Any], requested_model: str, payload: dict[str, Any]) -> dict[str, Any]:
         if provider.get("wire_api") == "responses":
@@ -1138,35 +1475,13 @@ class ChatForwardHandler(BaseHTTPRequestHandler):
         stream: bool,
         extra_headers: dict[str, str] | None = None,
     ) -> tuple[str, dict[str, str]]:
-        wire_api = provider.get("wire_api")
-        if wire_api == "responses":
-            upstream_url = provider["base_url"].rstrip("/") + "/responses"
-        elif wire_api == "gemini_generate_content":
-            action = "streamGenerateContent?alt=sse" if stream else "generateContent"
-            upstream_url = (
-                provider["base_url"].rstrip("/")
-                + f"/models/{quote(str(requested_model), safe='')}:{action}"
-            )
-        elif wire_api == "openai_chat_completions":
-            upstream_url = provider["base_url"].rstrip("/") + "/chat/completions"
-        else:
-            raise RequestError(500, f"Unsupported upstream wire_api: {wire_api}", "server_error")
-
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": "curl/8.5.0",
-        }
-        if extra_headers:
-            headers.update(extra_headers)
-
-        token = extract_bearer_token(dict(self.headers))
-        auth_header = provider.get("auth_header")
-        if auth_header:
-            if not token:
-                raise RequestError(401, "Missing upstream API key in Authorization bearer token.")
-            headers[auth_header] = f"{provider.get('auth_prefix', '')}{token}"
-
-        return upstream_url, headers
+        return build_upstream_request_from_headers(
+            provider,
+            requested_model,
+            dict(self.headers),
+            stream=stream,
+            extra_headers=extra_headers,
+        )
 
     def send_json(self, status: int, payload: dict[str, Any]) -> None:
         encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")

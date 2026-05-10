@@ -1,5 +1,6 @@
 import json
 import threading
+import time
 import unittest
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -10,6 +11,7 @@ import server
 
 class StubUpstreamHandler(BaseHTTPRequestHandler):
     last_request = None
+    stream_event_delay_seconds = 0.0
 
     def do_POST(self):
         content_length = int(self.headers["Content-Length"])
@@ -55,7 +57,9 @@ class StubUpstreamHandler(BaseHTTPRequestHandler):
             ]
             for event in events:
                 self.wfile.write(f"data: {json.dumps(event)}\n\n".encode("utf-8"))
-            self.wfile.flush()
+                self.wfile.flush()
+                if StubUpstreamHandler.stream_event_delay_seconds > 0:
+                    time.sleep(StubUpstreamHandler.stream_event_delay_seconds)
             return
 
         response = {
@@ -750,6 +754,91 @@ class ProxyTests(unittest.TestCase):
             proxy_server.server_close()
             upstream_server.server_close()
 
+    def test_end_to_end_fox_chat_completions_route_still_works(self):
+        upstream_server, _ = serve_in_thread(StubUpstreamHandler)
+        proxy_server, _ = serve_in_thread(server.ChatForwardHandler)
+        original_provider = server.PROVIDERS["fox"].copy()
+        server.PROVIDERS["fox"]["base_url"] = f"http://127.0.0.1:{upstream_server.server_address[1]}"
+
+        try:
+            request_body = {
+                "model": "gpt-4.1",
+                "messages": [{"role": "user", "content": "Say hi"}],
+            }
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{proxy_server.server_address[1]}/fox/v1/chat/completions",
+                data=json.dumps(request_body).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Authorization": "Bearer sk-test"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=5) as response:
+                body = json.loads(response.read().decode("utf-8"))
+
+            self.assertEqual(body["choices"][0]["message"]["content"], "proxy stream")
+            self.assertEqual(StubUpstreamHandler.last_request["path"], "/responses")
+        finally:
+            server.PROVIDERS["fox"] = original_provider
+            proxy_server.shutdown()
+            upstream_server.shutdown()
+            proxy_server.server_close()
+            upstream_server.server_close()
+
+    def test_end_to_end_fox_poll_stream_route(self):
+        upstream_server, _ = serve_in_thread(StubUpstreamHandler)
+        proxy_server, _ = serve_in_thread(server.ChatForwardHandler)
+        original_provider = server.PROVIDERS["fox"].copy()
+        original_delay = StubUpstreamHandler.stream_event_delay_seconds
+        server.PROVIDERS["fox"]["base_url"] = f"http://127.0.0.1:{upstream_server.server_address[1]}"
+        StubUpstreamHandler.stream_event_delay_seconds = 0.15
+
+        try:
+            request_body = {
+                "model": "gpt-4.1",
+                "messages": [{"role": "user", "content": "Say hi"}],
+            }
+            create_request = urllib.request.Request(
+                f"http://127.0.0.1:{proxy_server.server_address[1]}/fox/v1/chat/poll-completions",
+                data=json.dumps(request_body).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Authorization": "Bearer sk-test"},
+                method="POST",
+            )
+            with urllib.request.urlopen(create_request, timeout=5) as response:
+                create_body = json.loads(response.read().decode("utf-8"))
+
+            self.assertEqual(create_body["status"], "queued")
+            self.assertFalse(create_body["done"])
+            self.assertEqual(create_body["done_marker"], "[DONE]")
+
+            poll_url = f"http://127.0.0.1:{proxy_server.server_address[1]}{create_body['poll_url']}"
+            deltas: list[str] = []
+            final_body = None
+            started_at = time.time()
+
+            while time.time() - started_at < 5:
+                with urllib.request.urlopen(poll_url, timeout=5) as response:
+                    poll_body = json.loads(response.read().decode("utf-8"))
+
+                if poll_body["delta"]:
+                    deltas.append(poll_body["delta"])
+                if poll_body["done"]:
+                    final_body = poll_body
+                    break
+                time.sleep(0.05)
+
+            self.assertIsNotNone(final_body)
+            self.assertEqual(deltas, ["proxy ", "stream"])
+            self.assertEqual(final_body["status"], "completed")
+            self.assertEqual(final_body["done_marker"], "[DONE]")
+            self.assertEqual(final_body["accumulated_text"], "proxy stream")
+            self.assertEqual(final_body["usage"]["total_tokens"], 11)
+        finally:
+            StubUpstreamHandler.stream_event_delay_seconds = original_delay
+            server.PROVIDERS["fox"] = original_provider
+            proxy_server.shutdown()
+            upstream_server.shutdown()
+            proxy_server.server_close()
+            upstream_server.server_close()
+
     def test_end_to_end_gemini_proxy_route(self):
         upstream_server, _ = serve_in_thread(StubGeminiHandler)
         proxy_server, _ = serve_in_thread(server.ChatForwardHandler)
@@ -916,6 +1005,42 @@ class ProxyTests(unittest.TestCase):
             self.assertFalse(StubOpenAIChatHandler.last_request["body"]["enable_thinking"])
         finally:
             server.PROVIDERS["siliconflow"] = original_provider
+            proxy_server.shutdown()
+            upstream_server.shutdown()
+            proxy_server.server_close()
+            upstream_server.server_close()
+
+    def test_end_to_end_input_proxy_route(self):
+        upstream_server, _ = serve_in_thread(StubOpenAIChatHandler)
+        proxy_server, _ = serve_in_thread(server.ChatForwardHandler)
+        original_provider = server.PROVIDERS["input"].copy()
+        server.PROVIDERS["input"]["base_url"] = f"http://127.0.0.1:{upstream_server.server_address[1]}/v1"
+
+        try:
+            request_body = {
+                "model": "Qwen/Qwen3.5-35B-A3B",
+                "messages": [{"role": "user", "content": "Say hi"}],
+                "enable_thinking": True,
+            }
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{proxy_server.server_address[1]}/input/v1/chat/completions",
+                data=json.dumps(request_body).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Authorization": "Bearer sk-test"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=5) as response:
+                body = json.loads(response.read().decode("utf-8"))
+
+            self.assertEqual(body["choices"][0]["message"]["content"], "siliconflow works")
+            self.assertEqual(StubOpenAIChatHandler.last_request["path"], "/v1/chat/completions")
+            self.assertEqual(StubOpenAIChatHandler.last_request["headers"]["Authorization"], "Bearer sk-test")
+            self.assertFalse(StubOpenAIChatHandler.last_request["body"]["enable_thinking"])
+            self.assertEqual(
+                StubOpenAIChatHandler.last_request["body"]["model"],
+                "Qwen/Qwen3.5-35B-A3B",
+            )
+        finally:
+            server.PROVIDERS["input"] = original_provider
             proxy_server.shutdown()
             upstream_server.shutdown()
             proxy_server.server_close()

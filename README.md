@@ -7,8 +7,11 @@
 - `/codex-for-me/v1/chat/completions`
 - `/right/v1/chat/completions`
 - `/fox/v1/chat/completions`
+- `/fox/v1/chat/poll-completions`
+- `/fox/v1/chat/poll-completions/{request_id}`
 - `/fox-gemini/v1/chat/completions`
 - `/siliconflow/v1/chat/completions`
+- `/input/v1/chat/completions`
 
 ## 启动
 
@@ -57,6 +60,8 @@ SiliconFlow 路由本身就是 OpenAI `chat/completions` 协议，代理会直�
 
 也就是说，客户端仍然只需要传模型名和 key，例如 `Qwen/Qwen3.5-35B-A3B`，不需要自己处理关闭思考模式。
 
+`input` 路由同样是 OpenAI `chat/completions` 协议，默认上游指向 `https://ai.input.im/v1`，直接复用同样的 Bearer key 即可。
+
 流式调用示例：
 
 ```bash
@@ -73,6 +78,52 @@ curl http://127.0.0.1:8080/codex-for-me/v1/chat/completions \
     ]
   }'
 ```
+
+## Fox 轮询接口
+
+为了兼容不支持 SSE 的客户端，额外提供了一组只针对 `fox` 的轮询接口；原来的 `/fox/v1/chat/completions` 保持不变。
+
+1. 创建任务：
+
+```bash
+curl http://127.0.0.1:8080/fox/v1/chat/poll-completions \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer sk-your-key' \
+  -d '{
+    "model": "gpt-4.1",
+    "messages": [
+      {"role": "user", "content": "hello"}
+    ]
+  }'
+```
+
+返回示例：
+
+```json
+{
+  "id": "poll_xxx",
+  "object": "chat.completion.poll",
+  "status": "queued",
+  "done": false,
+  "done_marker": "[DONE]",
+  "poll_url": "/fox/v1/chat/poll-completions/poll_xxx"
+}
+```
+
+2. 轮询增量：
+
+```bash
+curl http://127.0.0.1:8080/fox/v1/chat/poll-completions/poll_xxx
+```
+
+返回字段说明：
+
+- `delta`: 自上次轮询后新增的文本片段
+- `accumulated_text`: 到当前为止的完整累计文本
+- `status`: `queued`、`running`、`completed`、`error`
+- `done`: 是否结束
+- `done_marker`: 结束时固定返回 `[DONE]`
+- `error`: 仅在 `status=error` 时返回
 
 ## 当前限制
 
