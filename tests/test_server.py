@@ -258,6 +258,13 @@ class StubOpenAIChatHandler(BaseHTTPRequestHandler):
                     "object": "chat.completion.chunk",
                     "created": 1710000003,
                     "model": "Qwen/Qwen3.5-35B-A3B",
+                    "choices": [{"index": 0, "delta": {"content": " more"}, "finish_reason": None}],
+                },
+                {
+                    "id": "chatcmpl-sf-stream",
+                    "object": "chat.completion.chunk",
+                    "created": 1710000003,
+                    "model": "Qwen/Qwen3.5-35B-A3B",
                     "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
                 },
             ]
@@ -364,6 +371,69 @@ class ProxyTests(unittest.TestCase):
         self.assertEqual(payload["input"][0]["content"], "You are helpful.")
         self.assertEqual(payload["input"][0]["role"], "developer")
         self.assertEqual(payload["input"][1]["content"][0]["type"], "input_text")
+
+    def test_cch_responses_payload_defaults_to_web_search_tool(self):
+        payload = server.chat_request_to_upstream_payload(
+            server.PROVIDERS["cch"],
+            {
+                "model": "gpt-5.4",
+                "messages": [{"role": "user", "content": "latest news"}],
+            },
+        )
+
+        self.assertEqual(payload["tools"], [{"type": "web_search"}])
+
+    def test_cch_responses_payload_preserves_requested_tools(self):
+        payload = server.chat_request_to_upstream_payload(
+            server.PROVIDERS["cch"],
+            {
+                "model": "gpt-5.4",
+                "messages": [{"role": "user", "content": "hello"}],
+                "tools": [{"type": "function", "name": "lookup"}],
+            },
+        )
+
+        self.assertEqual(
+            payload["tools"],
+            [{"type": "web_search"}, {"type": "function", "name": "lookup"}],
+        )
+
+    def test_cch_responses_payload_keeps_requested_web_search_options(self):
+        payload = server.chat_request_to_upstream_payload(
+            server.PROVIDERS["cch"],
+            {
+                "model": "gpt-5.4",
+                "messages": [{"role": "user", "content": "hello"}],
+                "tools": [{"type": "web_search", "search_context_size": "low"}],
+            },
+        )
+
+        self.assertEqual(payload["tools"], [{"type": "web_search", "search_context_size": "low"}])
+
+    def test_glm_openai_payload_defaults_to_thinking_disabled_and_web_search(self):
+        payload = server.chat_request_to_upstream_payload(
+            server.PROVIDERS["glm"],
+            {
+                "model": "glm-5",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+        self.assertEqual(payload["thinking"], {"type": "disabled"})
+        self.assertEqual(
+            payload["tools"],
+            [
+                {
+                    "type": "web_search",
+                    "web_search": {
+                        "enable": True,
+                        "search_engine": "Search-Pro-Quark",
+                        "search_result": True,
+                        "count": 10,
+                    },
+                }
+            ],
+        )
 
     def test_chat_request_to_gemini_payload(self):
         payload = server.chat_request_to_gemini_payload(
@@ -783,6 +853,76 @@ class ProxyTests(unittest.TestCase):
             proxy_server.server_close()
             upstream_server.server_close()
 
+    def test_end_to_end_cch_chat_completions_route_enables_web_search(self):
+        upstream_server, _ = serve_in_thread(StubUpstreamHandler)
+        proxy_server, _ = serve_in_thread(server.ChatForwardHandler)
+        original_provider = server.PROVIDERS["cch"].copy()
+        server.PROVIDERS["cch"]["base_url"] = f"http://127.0.0.1:{upstream_server.server_address[1]}"
+
+        try:
+            request_body = {
+                "model": "gpt-5.4",
+                "messages": [{"role": "user", "content": "Say hi"}],
+            }
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{proxy_server.server_address[1]}/cch/v1/chat/completions",
+                data=json.dumps(request_body).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Authorization": "Bearer sk-test"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=5) as response:
+                body = json.loads(response.read().decode("utf-8"))
+
+            self.assertEqual(body["choices"][0]["message"]["content"], "proxy stream")
+            self.assertEqual(StubUpstreamHandler.last_request["path"], "/responses")
+            self.assertEqual(StubUpstreamHandler.last_request["body"]["tools"], [{"type": "web_search"}])
+            self.assertEqual(StubUpstreamHandler.last_request["headers"]["Authorization"], "Bearer sk-test")
+            self.assertEqual(StubUpstreamHandler.last_request["headers"]["User-Agent"], "codex_cli_rs/0.0.0")
+        finally:
+            server.PROVIDERS["cch"] = original_provider
+            proxy_server.shutdown()
+            upstream_server.shutdown()
+            proxy_server.server_close()
+            upstream_server.server_close()
+
+    def test_cch_client_poll_stream_waits_for_delta(self):
+        upstream_server, _ = serve_in_thread(StubUpstreamHandler)
+        proxy_server, _ = serve_in_thread(server.ChatForwardHandler)
+        original_provider = server.PROVIDERS["cch"].copy()
+        original_delay = StubUpstreamHandler.stream_event_delay_seconds
+        server.PROVIDERS["cch"]["base_url"] = f"http://127.0.0.1:{upstream_server.server_address[1]}"
+        StubUpstreamHandler.stream_event_delay_seconds = 0.15
+
+        try:
+            request_body = {
+                "request_id": "shortcut-wait",
+                "model": "gpt-5.4",
+                "messages": [{"role": "user", "content": "Say hi"}],
+            }
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{proxy_server.server_address[1]}/cch/v1/chat/poll-completions",
+                data=json.dumps(request_body).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Authorization": "Bearer sk-test"},
+                method="POST",
+            )
+
+            started_at = time.time()
+            with urllib.request.urlopen(request, timeout=5) as response:
+                poll_body = json.loads(response.read().decode("utf-8"))
+
+            self.assertGreaterEqual(time.time() - started_at, 0.1)
+            self.assertEqual(poll_body["delta"], "proxy ")
+            self.assertEqual(poll_body["full_text"], "proxy ")
+            self.assertFalse(poll_body["done"])
+        finally:
+            StubUpstreamHandler.stream_event_delay_seconds = original_delay
+            server.PROVIDERS["cch"] = original_provider
+            server.CLIENT_POLL_STREAM_TASKS.clear()
+            proxy_server.shutdown()
+            upstream_server.shutdown()
+            proxy_server.server_close()
+            upstream_server.server_close()
+
     def test_end_to_end_fox_poll_stream_route(self):
         upstream_server, _ = serve_in_thread(StubUpstreamHandler)
         proxy_server, _ = serve_in_thread(server.ChatForwardHandler)
@@ -838,6 +978,141 @@ class ProxyTests(unittest.TestCase):
             upstream_server.shutdown()
             proxy_server.server_close()
             upstream_server.server_close()
+
+    def test_end_to_end_cch_client_poll_stream_route(self):
+        upstream_server, _ = serve_in_thread(StubUpstreamHandler)
+        proxy_server, _ = serve_in_thread(server.ChatForwardHandler)
+        original_provider = server.PROVIDERS["cch"].copy()
+        original_delay = StubUpstreamHandler.stream_event_delay_seconds
+        server.PROVIDERS["cch"]["base_url"] = f"http://127.0.0.1:{upstream_server.server_address[1]}"
+        StubUpstreamHandler.stream_event_delay_seconds = 0.15
+
+        try:
+            request_body = {
+                "request_id": "shortcut-1",
+                "model": "gpt-5.4",
+                "messages": [{"role": "user", "content": "Say hi"}],
+            }
+            url = f"http://127.0.0.1:{proxy_server.server_address[1]}/cch/v1/chat/poll-completions"
+            deltas: list[str] = []
+            final_body = None
+            started_at = time.time()
+
+            while time.time() - started_at < 5:
+                request = urllib.request.Request(
+                    url,
+                    data=json.dumps(request_body).encode("utf-8"),
+                    headers={"Content-Type": "application/json", "Authorization": "Bearer sk-test"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    poll_body = json.loads(response.read().decode("utf-8"))
+
+                if poll_body["delta"]:
+                    deltas.append(poll_body["delta"])
+                if poll_body["done"]:
+                    final_body = poll_body
+                    break
+                time.sleep(0.05)
+
+            self.assertIsNotNone(final_body)
+            self.assertEqual(deltas, ["proxy ", "stream"])
+            self.assertEqual(final_body["request_id"], "shortcut-1")
+            self.assertEqual(final_body["status"], "completed")
+            self.assertEqual(final_body["full_text"], "proxy stream")
+            self.assertEqual(final_body["done_marker"], "[DONE]")
+            self.assertEqual(final_body["usage"]["total_tokens"], 11)
+            self.assertEqual(StubUpstreamHandler.last_request["body"]["tools"], [{"type": "web_search"}])
+            self.assertTrue(StubUpstreamHandler.last_request["body"]["stream"])
+        finally:
+            StubUpstreamHandler.stream_event_delay_seconds = original_delay
+            server.PROVIDERS["cch"] = original_provider
+            server.CLIENT_POLL_STREAM_TASKS.clear()
+            proxy_server.shutdown()
+            upstream_server.shutdown()
+            proxy_server.server_close()
+            upstream_server.server_close()
+
+    def test_end_to_end_glm_client_poll_stream_route(self):
+        upstream_server, _ = serve_in_thread(StubOpenAIChatHandler)
+        proxy_server, _ = serve_in_thread(server.ChatForwardHandler)
+        original_provider = server.PROVIDERS["glm"].copy()
+        server.PROVIDERS["glm"]["base_url"] = f"http://127.0.0.1:{upstream_server.server_address[1]}/api/paas/v4"
+
+        try:
+            request_body = {
+                "request_id": "glm-shortcut-1",
+                "model": "glm-5",
+                "messages": [{"role": "user", "content": "Say hi"}],
+            }
+            url = f"http://127.0.0.1:{proxy_server.server_address[1]}/glm/v1/chat/poll-completions"
+            deltas: list[str] = []
+            final_body = None
+            started_at = time.time()
+
+            while time.time() - started_at < 5:
+                request = urllib.request.Request(
+                    url,
+                    data=json.dumps(request_body).encode("utf-8"),
+                    headers={"Content-Type": "application/json", "Authorization": "Bearer sk-test"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    poll_body = json.loads(response.read().decode("utf-8"))
+
+                if poll_body["delta"]:
+                    deltas.append(poll_body["delta"])
+                if poll_body["done"]:
+                    final_body = poll_body
+                    break
+                time.sleep(0.05)
+
+            self.assertIsNotNone(final_body)
+            self.assertEqual("".join(deltas), "siliconflow stream more")
+            self.assertEqual(final_body["request_id"], "glm-shortcut-1")
+            self.assertEqual(final_body["status"], "completed")
+            self.assertEqual(final_body["full_text"], "siliconflow stream more")
+            self.assertEqual(final_body["done_marker"], "[DONE]")
+            self.assertIn("usage", final_body)
+            self.assertEqual(StubOpenAIChatHandler.last_request["body"]["thinking"], {"type": "disabled"})
+            self.assertEqual(
+                StubOpenAIChatHandler.last_request["body"]["tools"],
+                [
+                    {
+                        "type": "web_search",
+                        "web_search": {
+                            "enable": True,
+                            "search_engine": "Search-Pro-Quark",
+                            "search_result": True,
+                            "count": 10,
+                        },
+                    }
+                ],
+            )
+            self.assertTrue(StubOpenAIChatHandler.last_request["body"]["stream"])
+        finally:
+            server.PROVIDERS["glm"] = original_provider
+            server.CLIENT_POLL_STREAM_TASKS.clear()
+            proxy_server.shutdown()
+            upstream_server.shutdown()
+            proxy_server.server_close()
+            upstream_server.server_close()
+
+    def test_client_poll_stream_task_limit_drops_oldest(self):
+        original_tasks = server.CLIENT_POLL_STREAM_TASKS.copy()
+        server.CLIENT_POLL_STREAM_TASKS.clear()
+
+        try:
+            for index in range(server.CLIENT_POLL_STREAM_TASK_LIMIT + 1):
+                task = server.PollingStreamTask("cch", "gpt-5.4", request_id=f"req-{index}")
+                server.register_client_polling_stream_task(task)
+
+            self.assertEqual(len(server.CLIENT_POLL_STREAM_TASKS), server.CLIENT_POLL_STREAM_TASK_LIMIT)
+            self.assertNotIn(("cch", "req-0"), server.CLIENT_POLL_STREAM_TASKS)
+            self.assertIn(("cch", "req-20"), server.CLIENT_POLL_STREAM_TASKS)
+        finally:
+            server.CLIENT_POLL_STREAM_TASKS.clear()
+            server.CLIENT_POLL_STREAM_TASKS.update(original_tasks)
 
     def test_end_to_end_gemini_proxy_route(self):
         upstream_server, _ = serve_in_thread(StubGeminiHandler)
@@ -1000,7 +1275,8 @@ class ProxyTests(unittest.TestCase):
             self.assertEqual(frames[-1], "[DONE]")
             self.assertEqual(chunks[0]["choices"][0]["delta"]["role"], "assistant")
             self.assertEqual(chunks[1]["choices"][0]["delta"]["content"], "siliconflow stream")
-            self.assertEqual(chunks[2]["choices"][0]["finish_reason"], "stop")
+            self.assertEqual(chunks[2]["choices"][0]["delta"]["content"], " more")
+            self.assertEqual(chunks[3]["choices"][0]["finish_reason"], "stop")
             self.assertTrue(StubOpenAIChatHandler.last_request["body"]["stream"])
             self.assertFalse(StubOpenAIChatHandler.last_request["body"]["enable_thinking"])
         finally:
