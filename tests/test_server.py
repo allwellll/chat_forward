@@ -414,11 +414,13 @@ class ProxyTests(unittest.TestCase):
         payload = server.chat_request_to_upstream_payload(
             server.PROVIDERS["glm"],
             {
+                "request_id": "43580",
                 "model": "glm-5",
                 "messages": [{"role": "user", "content": "hello"}],
             },
         )
 
+        self.assertNotIn("request_id", payload)
         self.assertEqual(payload["thinking"], {"type": "disabled"})
         self.assertEqual(
             payload["tools"],
@@ -1074,6 +1076,7 @@ class ProxyTests(unittest.TestCase):
             self.assertEqual(final_body["full_text"], "siliconflow stream more")
             self.assertEqual(final_body["done_marker"], "[DONE]")
             self.assertIn("usage", final_body)
+            self.assertNotIn("request_id", StubOpenAIChatHandler.last_request["body"])
             self.assertEqual(StubOpenAIChatHandler.last_request["body"]["thinking"], {"type": "disabled"})
             self.assertEqual(
                 StubOpenAIChatHandler.last_request["body"]["tools"],

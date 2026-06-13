@@ -742,6 +742,7 @@ def chat_request_to_openai_chat_payload(chat_request: dict[str, Any]) -> dict[st
     model, messages = validate_chat_request(chat_request)
 
     payload = dict(chat_request)
+    payload.pop("request_id", None)
     payload["model"] = model
     payload["messages"] = messages
     payload["enable_thinking"] = False
